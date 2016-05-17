@@ -46,6 +46,7 @@ class BreadServerProtocol(protocol.Protocol):
 		self._localClose = False
 
 	def dataReceived(self, data):
+		print data
 		if not self._recv:
 			try:
 				proto = identifyProtocol(data)
@@ -54,9 +55,9 @@ class BreadServerProtocol(protocol.Protocol):
 					klogging.error('ProtocolIdentifier with name {0} not mapped.'.format(proto.name))
 					self.transport.abortConnection()
 					return
-				localPort = self.factory.mappings[proto.name]
-				klogging.info('Local port: {0}'.format(localPort))
-				endpoint = TCP4ClientEndpoint(reactor, '127.0.0.1', localPort, self.factory.localTimeout)
+				host, port = self.factory.mappings[proto.name]
+				klogging.info('Local port: {0}'.format(port))
+				endpoint = TCP4ClientEndpoint(reactor, host, port, self.factory.localTimeout)
 
 				connect = endpoint.connect(self._clientFactory)
 				connect.addErrback(self._failedLocalConnection)
