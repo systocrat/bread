@@ -46,7 +46,6 @@ class BreadServerProtocol(protocol.Protocol):
 		self._localClose = False
 
 	def dataReceived(self, data):
-		print data
 		if not self._recv:
 			try:
 				proto = identifyProtocol(data)
