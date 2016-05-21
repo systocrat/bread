@@ -100,7 +100,7 @@ class Configurator(object):
 		return data
 
 localPort = ConfigOption(description='The local port to forward')
-forwards = ConfigOption(description='The forwards for breadproxy in a dictionary in the format of {\'protocolName\': [host, port]}')
+forwards = ConfigOption(description='The forwards for breadproxy in a dictionary in the format of {\'protocolName\': \'clientString\'}')
 
 configurator = Configurator('breadproxy.json')
 

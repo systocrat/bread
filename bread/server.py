@@ -1,113 +1,117 @@
 from twisted.internet import protocol
 from twisted.internet import reactor
-from twisted.internet.defer import Deferred
-from twisted.internet.endpoints import TCP4ClientEndpoint, TCP4ServerEndpoint
+from twisted.internet.endpoints import clientFromString, TCP4ServerEndpoint
 from twisted.internet.protocol import connectionDone
+from twisted.python import log
 
 import config
-import klogging
 from bread.identify import identifyProtocol, ProtocolNotFoundException
 
 
-class _BreadInternalClientProtocol(protocol.Protocol):
-	def __init__(self):
-		self.factory = None  # type: _BreadInternalClientFactory
-
-	def connectionMade(self):
-		self.factory.connectionMade.callback(self)
-
-	def dataReceived(self, data):
-		self.factory.dataReceived(data)
+# Thanks glyph!
+class PeeredConnection(protocol.Protocol):
+	noisy = True
+	peer = None
 
 	def connectionLost(self, reason=connectionDone):
-		self.factory.connectionLost.callback(reason)
+		if self.peer is not None:
+			self.peer.transport.loseConnection()
+			self.peer = None
+		elif self.noisy:
+			log.msg('Unable to connect to peer: {0}'.format(reason))
+
+	def dataReceived(self, data):
+		self.peer.transport.write(data)
+
+class _BreadInternalProxyClient(PeeredConnection):
+	def connectionMade(self):
+		self.peer.peer = self
+
+		# This hooks up the peer transport and our own transport for flow control
+		# This stops connections from filling proxy memory when one side produces too much data
+		# faster than the other can consume
+		# Reference: https://github.com/twisted/twisted/blob/2a6c7818ae18bd56ba2406d0a2f01b723bc5dc62/twisted/protocols/portforward.py#L35-L43
+		self.transport.registerProducer(self.peer.transport, True)
+		self.peer.transport.registerProducer(self.transport, True)
+
+		self.peer.transport.resumeProducing()
 
 
-class _BreadInternalClientFactory(protocol.Factory):
-	def __init__(self, dataReceived):
-		self.dataReceived = dataReceived
-		self.connectionMade = Deferred()
-		self.connectionLost = Deferred()
+class _BreadInternalClientFactory(protocol.ClientFactory):
+	protocol = _BreadInternalProxyClient
+
+	def __init__(self, server):
+		self.server = server
 
 	def buildProtocol(self, addr):
-		b = _BreadInternalClientProtocol()
-		b.factory = self
-		return b
+		prot = protocol.ClientFactory.buildProtocol(self, addr)
+		prot.peer = self.server
+		return prot
 
-class BreadServerProtocol(protocol.Protocol):
+	def clientConnectionFailed(self, connector, reason):
+		self.server.transport.loseConnection()
+
+
+class BreadServerProtocol(PeeredConnection):
+	noisy = True
+
 	def __init__(self):
 		self.factory = None  # type: BreadServerFactory
-		self._clientFactory = _BreadInternalClientFactory(self._clientDataReceived)
-		self._clientFactory.connectionMade.addCallback(self._clientConnectionMade)
-		self._clientFactory.connectionLost.addCallback(self._clientConnectionLost)
+		self._clientFactory = _BreadInternalClientFactory(self)
 		self._client = None
-		self._data = ''
-		self._recv = False
-		self._localClose = False
+		self._recv = False  # whether we've received data or not this instance
 
 	def dataReceived(self, data):
-		if not self._recv:
-			try:
-				proto = identifyProtocol(data)
-				klogging.info('ProtocolIdentifier identified: {0}'.format(proto.name))
-				if not self.factory.mappings.has_key(proto.name):
-					klogging.error('ProtocolIdentifier with name {0} not mapped.'.format(proto.name))
-					self.transport.abortConnection()
-					return
-				host, port = self.factory.mappings[proto.name]
-				klogging.info('Local port: {0}'.format(port))
-				endpoint = TCP4ClientEndpoint(reactor, host, port, self.factory.localTimeout)
+		if self._recv:
+			PeeredConnection.dataReceived(self, data)
+			return
+		self._recv = True
+		self.transport.pauseProducing()
+		try:
+			proto = identifyProtocol(data)
+			if self.noisy:
+				log.msg('ProtocolIdentifier identified: {0}'.format(proto.name))
 
-				connect = endpoint.connect(self._clientFactory)
-				connect.addErrback(self._failedLocalConnection)
-				self._recv = True
-				self._data += data
-			except ProtocolNotFoundException:
-				klogging.error('ProtocolIdentifier not found!')
+			if not self.factory.mappings.has_key(proto.name):
+				if self.noisy:
+					log.msg('ProtocolIdentifier with name {0} not mapped.'.format(proto.name))
 				self.transport.abortConnection()
 				return
-		elif self._recv and self._client is None:
-			self._data += data
-		else:
-			self._client.transport.write(data)
+			# build our endpoint from the config
+			endpoint = clientFromString(reactor, self.factory.mappings[proto.name])
 
-	def connectionLost(self, reason=connectionDone):
-		if not self._localClose and self._client is not None:
-			self._client.transport.abortConnection()
-		klogging.info('Finished forwarding proxy.')
+			if self.noisy:
+				log.msg('External endpoint built for protocol {0}: {1}'.format(proto.name, repr(endpoint)))
+
+			connect = endpoint.connect(self._clientFactory)
+			connect.addCallback(self._onLocalConnection, data)
+			connect.addErrback(self._failedLocalConnection)
+		except ProtocolNotFoundException:
+			if self.noisy:
+				log.msg('ProtocolIdentifier not found!')
+
+			self.transport.loseConnection()
+			return
+
+	def _onLocalConnection(self, protocol, data):
+		protocol.transport.write(data)
+		return protocol
 
 	def _failedLocalConnection(self, err):
-		klogging.error('Failed local connection: {0}'.format(repr(err)))
-		self.transport.abortConnection()
-
-	def _clientConnectionMade(self, protocol):
-		klogging.info('Local client connection made!')
-		self._client = protocol
-		protocol.transport.write(self._data)
-		self._data = ''
-
-	def _clientConnectionLost(self, reason):
-		klogging.info('Local client connection lost!')
-		self._localClose = True
+		log.msg('Reverse proxy connection failed: {0}'.format(err))
 		self.transport.loseConnection()
 
-	def _clientDataReceived(self, data):
-		klogging.info('Local client data length: {0}'.format(len(data)))
-		self.transport.write(data)
 
+class BreadServerFactory(protocol.ServerFactory):
+	protocol = BreadServerProtocol
 
-class BreadServerFactory(protocol.Factory):
 	def __init__(self, mappings=None, localTimeout=30):
 		self.mappings = mappings or dict()
 		self.localTimeout = localTimeout
 
-	def buildProtocol(self, addr):
-		b = BreadServerProtocol()
-		b.factory = self
-		return b
-
-
 if __name__ == '__main__':
+	import sys
+	log.startLogging(sys.stdout)
 	fac = BreadServerFactory(config.forwards, 40)
 	local = TCP4ServerEndpoint(reactor, config.localPort, interface='0.0.0.0')
 	local.listen(fac)
